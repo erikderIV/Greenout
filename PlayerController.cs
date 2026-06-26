@@ -9,22 +9,24 @@ public class PlayerController : MonoBehaviour
 
     [Header("Movement")]
     public float moveSpeed = 6f;
-    public float slideMulti = 2f;
-    public float crouchMulti = 0.5f;
+	public float maxStandingSpeed = 10f;
+	public float maxCrouchingSpeed = 5f;
+	public float slideStrength = 10f;
     public float gravity = -20f;
     public float jumpHeight = 1.5f;
-    public float slideTime = 1f;
-    public float slideCooldown = 3f;
-    public float crouchThreshold = 4f;
-    [Range(0f, 1f)] public float slideMax = 0.3f;
-    public float sidewaysDamping = 0.4f;
+    public float speedToSlide = 4f;
+	public float speedToKeepSliding = 1f;
+	public float slideCooldown = 1f;
+	public float groundFriction = 0.9f;
+	public float slideFriction = 0.8f;
+	public float airFriction = 0.98f;
+	public bool toggleCrouchSlide = false;
     public float standingHeight = 1.9f;
     public float crouchingHeight = 0.95f;
-    public float slidingHeight = 0.5f;
+    public float slidingHeight = 0.475f;
     public Vector3 standingCamPos = new Vector3(0, 1.7f, 0);
     public Vector3 crouchingCamPos = new Vector3(0, 0.85f, 0);
-    public Vector3 slidingCamPos = new Vector3(0, 0.34f, 0);
-    public float forwardAlignmentThreshold = 30;
+    public Vector3 slidingCamPos = new Vector3(0, 0.425f, 0);
 
     [Header("Look")]
     public float mouseSensitivity = 0.3f;
@@ -36,7 +38,7 @@ public class PlayerController : MonoBehaviour
     public event Action OnStopCrouch;
 
     public event Action OnStartFalling;
-    public event Action OnStopFalling;
+    public event Action<float> OnStopFalling;
 
     private CharacterController controller;
 
@@ -44,11 +46,10 @@ public class PlayerController : MonoBehaviour
 
     private Vector2 moveInput;
     private Vector2 lookInput;
-    private float verticalVelocity;
-    private float lastVerticalVelocity;
-    private float timer = 0f;
-    private Vector3 slideDir;
-    private Vector3 fallDir;
+	private Vector3 velocity;
+	private float currentHeight = 1.9f;
+	private Vector3 currentCamPos = new Vector3(0, 1.7f, 0);
+	private float timer = 0f;
     private float pitch;
     private bool wasGrounded;
     [System.NonSerialized] private MovementState state = MovementState.Standing;
@@ -74,8 +75,8 @@ public class PlayerController : MonoBehaviour
 
         inputAction.Player.Jump.performed += OnJump;
 
-        inputAction.Player.Crouch.performed += OnCrouch;
-        inputAction.Player.Crouch.canceled += OnCrouchCanceled;
+        inputAction.Player.Crouch.performed += OnCrouchSlide;
+        inputAction.Player.Crouch.canceled += OnCrouchSlideCanceled;
     }
 
     private void OnDisable()
@@ -93,8 +94,8 @@ public class PlayerController : MonoBehaviour
 
         inputAction.Player.Jump.performed -= OnJump;
 
-        inputAction.Player.Crouch.performed -= OnCrouch;
-        inputAction.Player.Crouch.canceled -= OnCrouchCanceled;
+        inputAction.Player.Crouch.performed -= OnCrouchSlide;
+        inputAction.Player.Crouch.canceled -= OnCrouchSlideCanceled;
     }
 
     private void OnMove(InputAction.CallbackContext ctx)
@@ -121,31 +122,39 @@ public class PlayerController : MonoBehaviour
     {
         if (!controller.isGrounded) return;
 
-        verticalVelocity = (Mathf.Sqrt(jumpHeight * -2f * gravity));
+        AddImpulse(Mathf.Sqrt(jumpHeight * -2f * gravity) * Vector3.up);
     }
 
-    private void OnCrouch(InputAction.CallbackContext ctx)
+    private void OnCrouchSlide(InputAction.CallbackContext ctx)
     {
-        if (Vector3ToHorizontalVelocity(controller.velocity) < crouchThreshold)
-            StartCrouch();
-        else
-            StartSlide();
+		if (toggleCrouchSlide)
+		{
+			if (state == MovementState.Crouching || state == MovementState.Sliding)
+				StopCrouchSlide();
+			else
+				StartCrouchSlide();
+		}
+		else
+		{
+			StartCrouchSlide();
+		}
     }
 
-    private void OnCrouchCanceled(InputAction.CallbackContext ctx)
+    private void OnCrouchSlideCanceled(InputAction.CallbackContext ctx)
     { 
-        if (state == MovementState.Crouching)
-            StopCrouch();
+		if (toggleCrouchSlide) return;
+		
+		StopCrouchSlide();		
     }
 
     private void Update()
     {
         UpdateAirborneState();
         UpdateSliding();
+		UpdateVelocity();
         Look();
         Move();
-
-        lastVerticalVelocity = verticalVelocity;
+		UpdateControllerAndCam();
     }
 
     private void UpdateAirborneState()
@@ -158,11 +167,11 @@ public class PlayerController : MonoBehaviour
             if (state == MovementState.Airborne)
             {
                 state = MovementState.Standing;
-                OnStopFalling?.Invoke();
+                OnStopFalling?.Invoke(velocity.y);
             }
         }
 
-        if (wasGrounded && !grounded && verticalVelocity < 0f)
+        if (wasGrounded && !grounded && velocity.y < 0f)
         {
             if (state != MovementState.Airborne)
             {
@@ -176,19 +185,73 @@ public class PlayerController : MonoBehaviour
 
     private void UpdateSliding()
     {
-        if (state == MovementState.Sliding)
-        {
-            timer -= Time.deltaTime;
-
-            if (timer <= 0f)
-                StopSlide();
-        }
-        else
-        {
-            timer = Mathf.Max(0f, timer - Time.deltaTime);
-            return;
-        }
+		timer = timer > 0f ? timer - Time.deltaTime : 0f;
+		
+		if (state == MovementState.Sliding && HorizontalVelocity(velocity) < speedToKeepSliding)
+		{
+			SlidingToCrouching();
+		}
     }
+	
+	private void UpdateVelocity()
+	{
+		Vector3 input = transform.right * moveInput.x + transform.forward * moveInput.y;
+		
+		input = Vector3.ClampMagnitude(input, 1f);
+		
+		Vector3 horizontal = new Vector3(velocity.x, 0, velocity.z);
+		
+		Vector3 accel = input;
+		
+		switch (state)
+		{
+			case MovementState.Standing:
+				accel *= moveSpeed;
+				horizontal += accel * Time.deltaTime;
+				
+				horizontal *= Mathf.Pow(groundFriction, Time.deltaTime * 60f);
+				
+				horizontal = Vector3.ClampMagnitude(horizontal, maxStandingSpeed);
+				
+				velocity.x = horizontal.x;
+				velocity.z = horizontal.z;
+			break;
+			case MovementState.Airborne:
+				accel *= moveSpeed * 0.3f;
+			
+				horizontal += accel * Time.deltaTime;
+				
+				velocity *= Mathf.Pow(airFriction, Time.deltaTime * 60f);
+				
+				velocity.y += gravity * Time.deltaTime;
+				velocity.x = horizontal.x;
+				velocity.z = horizontal.z;
+			break;
+			case MovementState.Crouching:
+				accel *= moveSpeed;
+				horizontal += accel * Time.deltaTime;
+				
+				horizontal *= Mathf.Pow(groundFriction, Time.deltaTime * 60f);
+				
+				horizontal = Vector3.ClampMagnitude(horizontal, maxCrouchingSpeed);
+				
+				velocity.x = horizontal.x;
+				velocity.z = horizontal.z;
+			break;
+			case MovementState.Sliding:
+				accel *= moveSpeed * 0.2f;
+				horizontal += accel * Time.deltaTime;
+				
+				horizontal *= Mathf.Pow(slideFriction, Time.deltaTime * 60f);
+				
+				velocity.x = horizontal.x;
+				velocity.z = horizontal.z;
+			break;
+		}
+		
+		if (velocity.sqrMagnitude < 0.001f)
+			velocity = Vector3.zero;
+	}
 
     private void Look()
     {
@@ -205,142 +268,105 @@ public class PlayerController : MonoBehaviour
 
     private void Move()
     {
-        Vector3 dir = state == MovementState.Sliding ? slideDir : ClampToUnit(transform.right * moveInput.x + transform.forward * moveInput.y);
-
-        float speed = state == MovementState.Sliding ? GetSlidingVelocity(timer, slideTime, moveSpeed, slideMulti, slideMax) : state == MovementState.Crouching ? moveSpeed * crouchMulti : moveSpeed;
-
-        if (!controller.isGrounded)
-            verticalVelocity += gravity * Time.deltaTime;
-        else if (verticalVelocity < 0f)
-            verticalVelocity = -1f;
-
-        Vector3 horizontalVelocity = GetHorizontalVelocity(dir, speed, sidewaysDamping);
-
-        Vector3 move = horizontalVelocity + Vector3.up * verticalVelocity;
-
-        controller.Move(move * Time.deltaTime);
+		if (controller.isGrounded && velocity.y < 0)
+			velocity.y = -2f;
+		
+        controller.Move(velocity * Time.deltaTime);
     }
+	
+	private void UpdateControllerAndCam()
+	{
+		Vector3 desiredCamPos;
+		float desiredHeight;
+		
+		switch (state)
+		{
+			case MovementState.Standing: desiredCamPos = standingCamPos; desiredHeight = standingHeight; break;
+			case MovementState.Crouching: desiredCamPos = crouchingCamPos; desiredHeight = crouchingHeight; break;
+			case MovementState.Sliding: desiredCamPos = slidingCamPos; desiredHeight = slidingHeight; break;
+			default: desiredCamPos = standingCamPos; desiredHeight = standingHeight; break;
+		}
+		
+		currentCamPos = new Vector3(0, Mathf.Lerp(currentCamPos.y, desiredCamPos.y, 10f * Time.deltaTime), 0);
+		currentHeight = Mathf.Lerp(currentHeight, desiredHeight, 10f * Time.deltaTime);
+		
+		cam.transform.localPosition = currentCamPos;
+		controller.height = currentHeight;
+		controller.center = new Vector3(0, currentHeight / 2, 0);
+	}
 
-    private Vector3 GetHorizontalVelocity(Vector3 direction, float speed, float damping)
-    {
-        Vector3 relForward = transform.forward;
-
-        float alpha = Vector2.Angle(FlatVector3(relForward), FlatVector3(direction));
-
-        return alpha < forwardAlignmentThreshold ? direction * speed : direction * speed * damping;
-    }
-
-    private Vector3 ClampToUnit(Vector3 v)
-    {
-        return Vector3.ClampMagnitude(v, 1f);
-    }
-
-    private Vector2 FlatVector3(Vector3 v)
-    {
-        return new Vector2(v.x, v.z);
-    }
-
-    private float Vector3ToHorizontalVelocity(Vector3 v)
+    private float HorizontalVelocity(Vector3 v)
     {
         v.y = 0;
         return v.magnitude;
     }
+	
+	public void AddImpulse(Vector3 impulse)
+	{
+		velocity += impulse;
+	}
 
-    private float GetSlidingVelocity(float t, float l, float vn, float m, float h)
-    {
-        float u = Mathf.Clamp01(t / l);
+    bool CanStartCrouchSlide() => state == MovementState.Standing && controller.isGrounded;
+	
+	private void StartCrouchSlide()
+	{
+		if (!CanStartCrouchSlide()) return;
+		
+		
+		if (HorizontalVelocity(velocity) >= speedToSlide && timer <= 0)
+		{
+			Debug.Log("Start Slide");
+			
+			state = MovementState.Sliding;
+			
+			Vector3 horizontal = new Vector3(velocity.x, 0, velocity.z);
 
-        if (h <= 0f || h >= 1f)
-            return vn;
+			AddImpulse(horizontal.normalized * slideStrength);
+			
+			OnStartSlide?.Invoke();
+		}
+		else
+		{
+			Debug.Log("Start Crouch");
+				
+			state = MovementState.Crouching;
 
-        // split curve at peak
-        float rise;
-        float fall;
+			OnStartCrouch?.Invoke();
+		}
+	}
+	
+	private void StopCrouchSlide()
+	{
+		if (state == MovementState.Sliding)
+		{
+			Debug.Log("Stop Slide");
+			
+			timer = slideCooldown;
 
-        if (u < h)
-        {
-            // fast rise
-            rise = Mathf.Pow(u / h, 2f);
-            return vn + vn * (m - 1f) * rise;
-        }
-        else
-        {
-            // slow fall (delayed decay)
-            float t2 = (u - h) / (1f - h);
+			state = MovementState.Standing;
 
-            // ease-out cubic (slower drop)
-            fall = 1f - Mathf.Pow(t2, 2.5f);
+			OnStopSlide?.Invoke();
+		}
+		else if (state == MovementState.Crouching)
+		{
+			Debug.Log("Stop Crouch");
 
-            return vn + vn * (m - 1f) * fall;
-        }
-    }
+			state = MovementState.Standing;
 
-    bool CanStartSlide() => state == MovementState.Standing && controller.isGrounded && timer <= 0f;
-    bool CanStartCrouch() => state == MovementState.Standing && controller.isGrounded;
-
-    private void StartCrouch()
-    {
-        if (!CanStartCrouch()) return;
-
-        Debug.Log("Start Crouch");
-
-        state = MovementState.Crouching;
-
-        /*controller.height = crouchingHeight;
-        cam.transform.localPosition = crouchingCamPos;*/
-
-        OnStartCrouch?.Invoke();
-    }
-
-    private void StopCrouch()
-    {
-        if (state != MovementState.Crouching) return;
-
-        Debug.Log("Stop Crouch");
-
-        state = MovementState.Standing;
-
-        /*controller.height = standingHeight;
-        cam.transform.localPosition = standingCamPos;*/
-
-        OnStopCrouch?.Invoke();
-    }
-
-    private void StartSlide()
-    {
-        if (!CanStartSlide()) return;
-
-        Debug.Log("Start Slide");
-
-        state = MovementState.Sliding;
-
-        timer = slideTime;
-
-        slideDir = controller.velocity;
-        slideDir.y = 0;
-        slideDir.Normalize();
-
-        /*controller.height = slidingHeight;
-        cam.transform.localPosition = slidingCamPos;*/
-
-        OnStartSlide?.Invoke();
-    }
-
-    private void StopSlide()
-    {
-        if (state != MovementState.Sliding) return;
-
-        Debug.Log("Stop Slide");
-
-        state = MovementState.Standing;
-
-        timer = slideCooldown;
-
-        /*controller.height = standingHeight;
-        cam.transform.localPosition = standingCamPos;*/
-
-        OnStopSlide?.Invoke();
-    }
+			OnStopCrouch?.Invoke();
+		}
+	}
+	
+	private void SlidingToCrouching()
+	{
+		if (state != MovementState.Sliding) return;
+		
+		state = MovementState.Crouching;
+		timer = slideCooldown;
+		OnStopSlide?.Invoke();
+		OnStartCrouch?.Invoke();
+		
+	}
 }
 
 enum MovementState
